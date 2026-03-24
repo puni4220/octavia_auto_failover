@@ -90,7 +90,7 @@ def list_capi_error_lbs(conn, all_projects: bool, name_regex: re.Pattern):
     except Exception as e:
         logger.exception("Failed to list loadbalancers: %s", e)
         sys.exit(1)
-    
+
     # Filter the lb(s) based on the name_regex
     logger.info("Filtering load balancers in ERROR state with match the regex pattern %s", name_regex.pattern)
     filtered_lbs = []
@@ -109,7 +109,7 @@ def failover_capi_error_lb(conn, lb_id: str):
     """
     logger = get_file_logger()
     logger.info("Initiating failover for load balancer %s", lb_id)
-    
+
     try:
         conn.load_balancer.failover_load_balancer(lb_id)
         logger.info("Failover initiated successfully for load balancer %s", lb_id)
@@ -120,7 +120,7 @@ def failover_capi_error_lb(conn, lb_id: str):
 
 def refresh_capi_error_lb_state(conn, lb_id: str):
     """
-    Attempts to obtain the new state of the lb 
+    Attempts to obtain the new state of the lb
     post successful failover attempt
     """
 
@@ -140,7 +140,7 @@ def refresh_capi_error_lb_state(conn, lb_id: str):
 def main():
     parser = argparse.ArgumentParser(description="Failover Octavia load balancers stuck in provisioning ERROR.")
     parser.add_argument("--cloud", help="Cloud name from clouds.yaml (optional).")
-    parser.add_argument("--limit", type=int, default=5,
+    parser.add_argument("--limit", type=int, default=10,
                         help="Max number of load balancers to failover in this run. Default: 5")
     parser.add_argument("--sleep-between", type=int, default=2,
                         help="Seconds to sleep between successive failover calls. Default: 2")
@@ -152,10 +152,13 @@ def main():
     args = parser.parse_args()
     logger = get_file_logger()
 
+    # declare an array for lb(s) for which failover request was successful
+    failover_success_lbs = []
+
     if args.limit > 10:
         logger.error("LB failover limit can not be higher than 10")
         sys.exit(1)
-    
+
     try:
         conn = get_connection(args.cloud)
     except Exception as e:
@@ -163,7 +166,7 @@ def main():
         sys.exit(1)
 
     logger.info("Connected to Octavia API")
-     
+
     capi_lbs = list_capi_error_lbs(conn, True, re.compile(r'^k8s-clusterapi'))
 
     if not capi_lbs:
@@ -185,7 +188,7 @@ def main():
     for capi_lb in capi_lbs:
         if counter >= args.limit:
             break
-        
+
         # obtain the lb id
         lb_id = getattr(capi_lb, "id")
         lb_name = getattr(capi_lb, "name", "") or ""
@@ -197,27 +200,52 @@ def main():
 
         prov_state = getattr(capi_lb, "provisioning_status", "")
         logger.info("Target LB id=%s name='%s' provisioning_status=%s", lb_id, lb_name, prov_state)
-        
+
         if args.dry_run:
             logger.info("DRY RUN: no failover will be triggered for lb %s", lb_id)
             counter +=1 # count increment to prevent endless looping
-            time.sleep(max(0, args.sleep_between)) 
+            time.sleep(max(0, args.sleep_between))
             continue # skip the rest of the loop as it's only dry run
-        
+
         # trigger the failover for the lb
         ok, msg = failover_capi_error_lb(conn, lb_id)
         if not ok:
             counter +=1 # increment the counter even on failure to prevent endless looping
             time.sleep(max(0, args.sleep_between)) # prevent hammering the api
             # failover failed skip the rest of the loop and try the other lb(s)
-            continue 
+            continue
 
         # increment the counter; failover request was accepted by the api
         counter +=1
+
+        # append the id of the lb(s) for which request was successful
+        failover_success_lbs.append(lb_id)
+
         # prevent hammering the api
         time.sleep(max(0, args.sleep_between))
 
     logger.info("All required lb(s) failover sucessful")
+
+    # sleep for --post-wait and then check the state of each lb
+    logger.info("Sleeping for %s seconds before checking the state of failed over lb(s)", args.post_wait)
+
+    time.sleep(max(0, args.post_wait))
+
+    # check the status of all the lb(s) which were failed over
+    for idx, lb_id in enumerate(failover_success_lbs):
+
+        if idx > 0:
+            time.sleep(max(0, args.sleep_between))
+
+        lb = refresh_capi_error_lb_state(conn, lb_id)
+
+        if not lb:
+            logger.warning("Unable to determine state for lb %s after post-wait", lb_id)
+            continue
+
+        provisioning_state = getattr(lb, "provisioning_status", "UNKNOWN")
+
+        logger.info("Post-failover state for LB id=%s: provisioning_status=%s", lb_id, provisioning_state)
 
 if __name__ == "__main__":
     main()
